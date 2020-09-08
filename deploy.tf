@@ -14,6 +14,11 @@ variable "azure_region" {
   description = "Azure region"
 }
 
+variable "package_file" {
+  description = "Azure function ZIP package"
+  default = "./package/lm-logs-azure.zip"
+}
+
 locals {
   namespace = "lm-logs-${var.lm_company_name}-${var.azure_region}"
   storage = lower(replace(replace(local.namespace, "2", "two"), "/[^A-Za-z]+/", ""))
@@ -73,6 +78,48 @@ resource "azurerm_storage_account" "lm_logs" {
   account_replication_type = "LRS"
 }
 
+resource "azurerm_storage_container" "lm_logs" {
+  name                  = "package"
+  storage_account_name  = azurerm_storage_account.lm_logs.name
+  container_access_type = "private"
+}
+
+resource "azurerm_storage_blob" "lm_logs" {
+  name                   = "lm-logs-azure.zip"
+  storage_account_name   = azurerm_storage_account.lm_logs.name
+  storage_container_name = azurerm_storage_container.lm_logs.name
+  type                   = "Block"
+  source                 = var.package_file
+}
+
+data "azurerm_storage_account_sas" "sas" {
+  connection_string = azurerm_storage_account.lm_logs.primary_connection_string
+  https_only        = true
+  start             = formatdate("YYYY-MM-DD", timestamp())
+  expiry            = formatdate("YYYY-MM-DD", timeadd(timestamp(), "87600h")) # + 10 years
+  resource_types {
+    object    = true
+    container = false
+    service   = false
+  }
+  services {
+    blob      = true
+    queue     = false
+    table     = false
+    file      = false
+  }
+  permissions {
+    read      = true
+    write     = false
+    delete    = false
+    list      = false
+    add       = false
+    create    = false
+    update    = false
+    process   = false
+  }
+}
+
 resource "azurerm_app_service_plan" "lm_logs" {
   name                = "${local.namespace}-service-plan"
   resource_group_name = azurerm_resource_group.lm_logs.name
@@ -102,7 +149,8 @@ resource "azurerm_function_app" "lm_logs" {
   app_settings = {
     FUNCTIONS_WORKER_RUNTIME     = "java"
     FUNCTIONS_EXTENSION_VERSION  = "~3"
-    WEBSITE_RUN_FROM_PACKAGE     = "https://github.com/logicmonitor/lm-logs-azure/raw/master/package/lm-logs-azure.zip"
+    HASH                         = base64encode(filesha256(var.package_file))
+    WEBSITE_RUN_FROM_PACKAGE     = "https://${azurerm_storage_account.lm_logs.name}.blob.core.windows.net/${azurerm_storage_container.lm_logs.name}/${azurerm_storage_blob.lm_logs.name}${data.azurerm_storage_account_sas.sas.sas}"
     LogsEventHubConnectionString = azurerm_eventhub_authorization_rule.lm_logs_listener.primary_connection_string
     LogicMonitorCompanyName      = var.lm_company_name
     LogicMonitorAccessId         = var.lm_access_id
